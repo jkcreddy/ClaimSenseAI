@@ -6,6 +6,27 @@ from typing import Optional
 from pydantic import BaseModel
 
 
+# ── /auth ────────────────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "Bearer"
+    expires_in: int
+    user_id: str
+    group: str   # the Cognito group the user belongs to
+
+
+class CallerIdentity(BaseModel):
+    """Decoded JWT identity — passed through the entire request pipeline."""
+    user_id: str
+    group: str   # adjuster | senior-adjuster | fraud-investigator | total-loss-appraiser
+
+
 # ── /config ──────────────────────────────────────────────────────────────────
 
 class AdjudicationConfig(BaseModel):

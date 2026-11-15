@@ -22,6 +22,7 @@ from src.api.schemas_ui import (
 from src.api.rbac import can_read_claim, AuditLogger
 from src.api.fixtures import load_claim, load_policy
 from src.api.signals import compute_signals
+from src.agents.guardrails import quarantine_input_guardrail, citation_and_payout_guardrail
 
 logger = logging.getLogger(__name__)
 _audit = AuditLogger()
@@ -69,16 +70,77 @@ async def handle_invocation(
         )
     policy = load_policy(claim["policy_id"])
 
-    # ── 3. Deterministic signal layer (DEC-002) ───────────────────────────────
+    # ── 3. Input Guardrail: Prompt Injection & XPIA Quarantine ───────────────
+    input_scan_payload = {
+        "prompt": body.prompt,
+        "claim_id": body.claim_id,
+        "incident_description": claim.get("incident_description", ""),
+        "damage_description": claim.get("damage_description", ""),
+    }
+    input_guard_result = quarantine_input_guardrail(input_scan_payload)
+    if not input_guard_result.passed:
+        _audit.log(
+            user_id=body.user_id,
+            group=body.group,
+            claim_id=body.claim_id,
+            result="quarantined",
+            reason=input_guard_result.reason,
+        )
+        total_ms = int((time.monotonic() - t0) * 1000)
+        return InvocationResponse(
+            status="flag_review",
+            response=f"Security alert for {body.claim_id}: {input_guard_result.reason}. Flagged for manual review.",
+            data_backend="fixtures",
+            assessment=Assessment(
+                decision="flag_review",
+                validation_status="GUARDRAIL_BLOCKED",
+                confidence=0.0,
+                net_payable_estimate_usd=0.0,
+                rationale=f"Quarantined by input guardrail: {input_guard_result.reason}",
+                key_findings=["Prompt injection or adversarial attack signature detected."],
+                required_actions=["Refer to CISO / SIU security review.", "Quarantine input files."],
+                flags=["prompt_injection_detected", "guardrail_quarantined"],
+                citations=[],
+                baseline_rules_decision="flag_review",
+                agrees_with_baseline=True,
+                engine="guardrail-tripwire",
+                fallback_reason=input_guard_result.reason,
+                latency_ms=total_ms,
+            ),
+            claim=ClaimDetail(
+                claim_id=claim["claim_id"],
+                incident_type=claim["incident_type"],
+                vehicle_year=int(claim["vehicle_year"]),
+                vehicle_make=claim["vehicle_make"],
+                vehicle_model=claim["vehicle_model"],
+                claim_status=claim["claim_status"],
+            ),
+            policy=PolicyDetail(
+                policy_id=policy["policy_id"],
+                coverage_type=policy["coverage_type"],
+                policy_status=policy["policy_status"],
+            ) if policy else None,
+        )
+
+    # ── 4. Deterministic signal layer (DEC-002) ───────────────────────────────
     signals = compute_signals(claim, policy)
 
-    # ── 4. Baseline rule decision (DEC-003) ───────────────────────────────────
+    # ── 5. Baseline rule decision (DEC-003) ───────────────────────────────────
     baseline_decision = _apply_rules(signals)
 
-    # ── 5. Agent pipeline (or rule-engine fallback) ───────────────────────────
+    # ── 6. Agent pipeline (or rule-engine fallback) ───────────────────────────
     assessment, pipeline_agents, policy_citations, used_llm = await _run_pipeline(
-        body, claim, policy, signals, baseline_decision
+        body, claim, policy, signals, baseline_decision, jwt_token
     )
+
+    # ── 7. Output Guardrail: Citation & Payout Verification ───────────────────
+    out_guard_result = citation_and_payout_guardrail(assessment.model_dump(), signals)
+    if not out_guard_result.passed:
+        logger.warning("Output guardrail tripped: %s", out_guard_result.reason)
+        assessment.validation_status = out_guard_result.status
+        assessment.decision = "flag_review"
+        assessment.flags.append("guardrail_tripwire_triggered")
+        assessment.rationale += f" [Fail-Closed Guardrail: {out_guard_result.reason}]"
 
     total_ms = int((time.monotonic() - t0) * 1000)
     assessment.latency_ms = total_ms
@@ -138,29 +200,41 @@ def _apply_rules(signals: dict) -> str:
 
 # ── Pipeline runner ───────────────────────────────────────────────────────────
 
-async def _run_pipeline(body, claim, policy, signals, baseline_decision):
+async def _run_pipeline(body, claim, policy, signals, baseline_decision, jwt_token):
     """
     Attempt the 3-stage LLM pipeline. Falls back to rule engine if unavailable.
     Returns (Assessment, pipeline_agents, policy_citations, used_llm).
     """
-    try:
-        from src.agents.orchestrator import ClaimSenseOrchestrator
-        from src.mcp.server import GovernedMCPDoor
-        from src.mcp.auth_context import set_current_adjuster
-        from src.models.schemas import AdjusterIdentity
+    # In local dev / console UI, if no token is explicitly pasted into the UI box,
+    # issue a development badge for the active user so the multi-agent pipeline runs seamlessly
+    if not jwt_token:
+        from src.api.auth import _issue_token
+        jwt_token = _issue_token(body.user_id, body.group)
 
-        set_current_adjuster(
-            AdjusterIdentity(
-                adjuster_id=body.user_id,
-                email=f"{body.user_id}@autosure.example",
-                role=body.group,
-                licensed_states=["TX"],
+    try:
+        from src.mcp.auth_context import set_jwt, reset_jwt
+        from src.mcp.server import GovernedMCPDoor
+
+        # Bind JWT to async context so every MCP tool call can verify the caller
+        ctx_token = set_jwt(jwt_token)
+        try:
+            door = GovernedMCPDoor()
+            # Eagerly verify the MCP door can resolve the caller before agent runs
+            caller = door._caller()
+            logger.info("MCP door ready: caller=%s group=%s", caller.user_id, caller.group)
+
+            # ── Multi-Agent 3-Stage Pipeline ──────────────────────────────────
+            from src.agents.orchestrator import ClaimSenseOrchestrator
+            orch = ClaimSenseOrchestrator(mcp_door=door)
+            orch_result = await orch.process_claim_async(
+                claim_input=claim,
+                prompt=body.prompt,
+                signals=signals,
+                baseline_decision=baseline_decision,
             )
-        )
-        door = GovernedMCPDoor()
-        orch = ClaimSenseOrchestrator(mcp_door=door)
-        result = await orch.process_claim_async(body.claim_id, signals, baseline_decision)
-        return result.assessment, result.pipeline, result.policy_citations, True
+            return orch_result.assessment, orch_result.pipeline, orch_result.policy_citations, True
+        finally:
+            reset_jwt(ctx_token)
 
     except Exception as exc:
         logger.warning("LLM pipeline unavailable, using rule engine: %s", exc)
